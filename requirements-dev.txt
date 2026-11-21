@@ -1,0 +1,5 @@
+# Development / evaluation tooling (tools/*.py)
+-r requirements.txt
+pandas>=2.0
+evo>=1.28
+matplotlib>=3.7

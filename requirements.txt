@@ -1,0 +1,2 @@
+# Runtime dependency of src/main.py (the submission entrypoint)
+numpy>=1.24

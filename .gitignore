@@ -1,0 +1,12 @@
+# local environments
+.venv/
+__pycache__/
+*.pyc
+
+# datasets and generated outputs (large / third-party)
+data/
+*.zip
+!submission/*.zip
+
+# organiser material is kept outside this repository
+personal/
