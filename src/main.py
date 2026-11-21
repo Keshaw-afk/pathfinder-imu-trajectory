@@ -66,8 +66,8 @@ CFG = {
     "conf_power": 1.0,        # velocity confidence = noise_ratio^-power (0 = off)
     "blind_vmax_xy": 1.5,     # clamp on extrapolated horizontal speed [m/s]
     "blind_vmax_z": 0.5,      # clamp on extrapolated vertical speed [m/s]
-    "vel_hp_s": 30.0,         # velocity high-pass window [s] (0 = off)
-    "pos_hp_s": 30.0,        # position high-pass window [s] (0 = off)
+    "vel_hp_s": 6.0,          # velocity high-pass window [s] (0 = off)
+    "pos_hp_s": 10.0,         # position high-pass window [s] (0 = off)
     "pos_mode": "drag",        # "hp" | "drag" | "zero" (baseline: no translation)
     "drag_lp_s": 0.0,         # extra low-pass on the drag velocity [s]
     "drag_scale_min": -10.0,  # bound on fitted velocity/drag scale (= -1/k) [s]
