@@ -51,7 +51,11 @@ G0 = 9.80665
 # Tunable parameters (values chosen on degraded EuRoC / TUM-VI sequences; see
 # tools/evaluate.py and the README results table).
 CFG = {
-    "init_window_s": 1.8,     # clean lead-in used for initialisation
+    "init_window_s": 1.8,     # clean lead-in used for initial attitude
+    "static_win_s": 2.0,      # length of the rest window for bias / |g|
+    "static_search_s": 60.0,  # search the rest window within this lead time
+    "static_gyr_std": 0.05,   # rest thresholds (per-axis std) [rad/s]
+    "static_acc_std": 0.4,    # [m/s^2]
     "hampel_half": 4,         # half window (samples) of the spike filter
     "hampel_k": 8.0,          # rejection threshold in robust sigmas
     "att_kp": 0.05,           # accel->attitude correction gain [1/s]
@@ -66,6 +70,7 @@ CFG = {
     "pos_hp_s": 30.0,        # position high-pass window [s] (0 = off)
     "pos_mode": "drag",        # "hp" | "drag" | "zero" (baseline: no translation)
     "drag_lp_s": 0.0,         # extra low-pass on the drag velocity [s]
+    "drag_scale_min": -10.0,  # bound on fitted velocity/drag scale (= -1/k) [s]
     "att_mode": "filter",     # "filter" | "identity" (baseline)
     "blind_tau_s": 1.0,       # velocity decay constant after IMU failure
     "blind_vel_win_s": 1.0,   # window to estimate the last velocity
@@ -252,6 +257,33 @@ def hampel_inplace(x, half, k, chunk):
             blk = x[s:e]
             blk[bad] = med[bad]
     return out_fixes
+
+
+# --------------------------------------------------------------------------
+# Static-window search (initial gyro bias and gravity magnitude)
+# --------------------------------------------------------------------------
+def find_static_window(tv, gyr, acc, cfg):
+    """Index range [lo, hi) of the quietest window of length static_win_s
+    within the first static_search_s seconds (degradation is weakest early).
+    Returns None if nothing is quiet enough to be called static."""
+    win = cfg["static_win_s"]
+    t0 = float(tv[0])
+    t_end = min(float(tv[-1]), t0 + cfg["static_search_s"])
+    step = 0.5
+    best, best_score = None, None
+    t = t0
+    while t + win <= t_end:
+        lo = int(np.searchsorted(tv, t))
+        hi = int(np.searchsorted(tv, t + win))
+        if hi - lo > 50:
+            gs = float(gyr[lo:hi].std(axis=0).max())
+            asd = float(acc[lo:hi].std(axis=0).max())
+            sc = gs / 0.01 + asd / 0.1
+            if gs < cfg["static_gyr_std"] and asd < cfg["static_acc_std"] and (
+                    best_score is None or sc < best_score):
+                best, best_score = (lo, hi), sc
+        t += step
+    return best
 
 
 # --------------------------------------------------------------------------
@@ -526,6 +558,8 @@ def integrate_position(tv, acc_w, cfg, pos_out, drag_w=None, vel_w=None):
         scale = num / den if den > 0 else 0.0
         if scale > 0:          # physically the drag opposes velocity
             scale = 0.0
+        scale = max(scale, cfg["drag_scale_min"])
+        cfg["_drag_scale"] = scale
     v_end = np.zeros(3)
     for ax in range(3):
         v = _vel_from_acc(acc_w[:, ax].astype(np.float64), dt)
@@ -594,18 +628,37 @@ def estimate(ts, raw, cfg=CFG, log=None):
     k_init = max(20, int(np.searchsorted(tv, t_init)))
     k_init = min(k_init, m)
     a_mean = acc[:k_init].astype(np.float64).mean(axis=0)
-    g_mag = float(np.median(np.linalg.norm(acc[:k_init], axis=1)))
-    gyr_std = float(gyr[:k_init].astype(np.float64).std(axis=0).max())
-    acc_std = float(acc[:k_init].astype(np.float64).std(axis=0).max())
-    static = gyr_std < 0.05 and acc_std < 0.5
-    bias0 = gyr[:k_init].astype(np.float64).mean(axis=0) if static else np.zeros(3)
-    if not (8.0 < g_mag < 11.5):
+    # Gyro bias and |g| need the platform at rest. EuRoC MH_01-03 start with
+    # the drone carried by hand, so search the early part of the recording
+    # for the quietest window instead of trusting the first seconds.
+    sw = find_static_window(tv, gyr, acc, cfg)
+    if sw is not None:
+        lo, hi = sw
+        bias0 = gyr[lo:hi].astype(np.float64).mean(axis=0)
+        g_mag = float(np.median(np.linalg.norm(acc[lo:hi], axis=1)))
+        static = True
+    else:
+        bias0 = np.zeros(3)
+        g_mag = G0
+        static = False
+    if not (9.0 < g_mag < 10.6):
         g_mag = G0
     q0 = quat_from_two_vectors(a_mean, np.array([0.0, 0.0, 1.0]))
-    say("init: static=%s g=%.4f bias=%s" % (static, g_mag, np.round(bias0, 5)))
+    say("init: static window=%s g=%.4f bias=%s" % (
+        None if sw is None else (round(float(tv[sw[0]]), 1), round(float(tv[sw[1] - 1]), 1)),
+        g_mag, np.round(bias0, 5)))
 
     quat = np.empty((m, 4), np.float32)
-    thrust = a_mean / np.linalg.norm(a_mean) if cfg["pos_mode"] == "drag" else None
+    thrust = None
+    if cfg["pos_mode"] == "drag":
+        # Over a whole flight, a multirotor's mean body-frame specific force
+        # points along its thrust axis (drag averages out). Using the flight
+        # mean also cancels any constant body-frame accelerometer bias in the
+        # perpendicular (drag) channel.
+        a_flight = np.zeros(3)
+        for s0 in range(0, m, ch):
+            a_flight += acc[s0:s0 + ch].astype(np.float64).sum(axis=0)
+        thrust = a_flight / np.linalg.norm(a_flight)
     kp_blocks, noise_ratio = adaptive_kp(tv, gyr, acc, cfg)
     say("gyro noise ratio (max/early)=%.2f  kp range %.3f..%.3f"
         % (float(noise_ratio.max()), min(kp_blocks), max(kp_blocks)))
@@ -617,6 +670,8 @@ def estimate(ts, raw, cfg=CFG, log=None):
     vel_w = (noise_ratio ** -pw) if pw > 0 else None
     v_end = integrate_position(tv, acc, cfg, pos, gyr if thrust is not None else None, vel_w)
     del acc, gyr
+    if "_drag_scale" in cfg:
+        say("drag velocity scale (-1/k) = %.3f s" % cfg["_drag_scale"])
     vxy = float(np.hypot(v_end[0], v_end[1]))
     if vxy > cfg["blind_vmax_xy"]:
         v_end[:2] *= cfg["blind_vmax_xy"] / vxy
@@ -677,6 +732,7 @@ def write_tum(out_path, ts, tv, pos, quat, v_end, cfg=CFG, chunk=1024):
 
 
 def run(inp, out, cfg=CFG, verbose=False):
+    cfg = dict(cfg)
     log = (lambda *a: print("[pathfinder]", *a, file=sys.stderr)) if verbose else None
     ts, raw = load_imu(inp)
     tv, pos, quat, ex = estimate(ts, raw, cfg, log)
