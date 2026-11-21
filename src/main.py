@@ -57,9 +57,14 @@ CFG = {
     "att_kp": 0.05,           # accel->attitude correction gain [1/s]
     "att_ki": 0.002,          # gyro-bias integral gain [1/s^2]
     "att_acc_sigma": 1.5,     # |a|-g tolerance for the correction [m/s^2]
-    "vel_hp_s": 6.0,          # velocity high-pass window [s] (0 = off)
-    "pos_hp_s": 30.0,         # position high-pass window [s] (0 = off)
-    "pos_mode": "hp",         # "hp" | "drag" | "zero" (baseline: no translation)
+    "adapt_block_s": 2.0,     # block length for gyro-noise monitoring [s]
+    "adapt_kp_max_ratio": 40.0,  # max gain boost when the gyro degrades (1 = off)
+    "conf_power": 1.0,        # velocity confidence = noise_ratio^-power (0 = off)
+    "blind_vmax_xy": 1.5,     # clamp on extrapolated horizontal speed [m/s]
+    "blind_vmax_z": 0.5,      # clamp on extrapolated vertical speed [m/s]
+    "vel_hp_s": 30.0,         # velocity high-pass window [s] (0 = off)
+    "pos_hp_s": 30.0,        # position high-pass window [s] (0 = off)
+    "pos_mode": "drag",        # "hp" | "drag" | "zero" (baseline: no translation)
     "drag_lp_s": 0.0,         # extra low-pass on the drag velocity [s]
     "att_mode": "filter",     # "filter" | "identity" (baseline)
     "blind_tau_s": 1.0,       # velocity decay constant after IMU failure
@@ -250,6 +255,51 @@ def hampel_inplace(x, half, k, chunk):
 
 
 # --------------------------------------------------------------------------
+# Adaptive attitude gain
+# --------------------------------------------------------------------------
+def adaptive_kp(tv, gyr, acc, cfg):
+    """Per-block accelerometer-correction gain.
+
+    Jamming adds isotropic white noise that grows over the flight. Rotor
+    vibration is strongly anisotropic and depends on the manoeuvre, so we
+    track the noise of the QUIETEST gyro axis (robust sample-to-sample
+    spread) in blocks, relative to its early-flight value. Where it rises,
+    the gyro is being degraded and the attitude filter leans on gravity more
+    (gain ~ ratio^2, the optimal complementary crossover for white noise).
+    Returns (list of per-block gains, per-block noise ratio >= 1)."""
+    blk = cfg["adapt_block_s"]
+    t0 = float(tv[0])
+    nb = int((float(tv[-1]) - t0) / blk) + 1
+    edges = np.searchsorted(tv, t0 + blk * np.arange(nb + 1))
+    sg = np.zeros(nb)
+    sa = np.zeros(nb)
+    for b in range(nb):
+        lo, hi = edges[b], edges[b + 1]
+        if hi - lo > 10:
+            sg[b] = float(np.median(np.abs(np.diff(gyr[lo:hi], axis=0)), axis=0).min())
+            sa[b] = float(np.median(np.abs(np.diff(acc[lo:hi], axis=0)), axis=0).min())
+    valid = sg > 0
+    lead = max(1, int(np.ceil(cfg["init_window_s"] / blk)))
+    if valid.sum() < lead + 4:
+        return [cfg["att_kp"]] * nb, np.ones(nb)
+    # "in flight" blocks: accelerometer vibration well above the lead-in level
+    sa_lead = float(np.median(sa[:lead][valid[:lead]])) if valid[:lead].any() else 0.0
+    flight = valid & (sa > 3.0 * sa_lead)
+    flight[:lead] = False
+    if flight.sum() < 4:
+        flight = valid.copy()
+        flight[:lead] = False
+    fidx = np.flatnonzero(flight)
+    ref = float(np.median(sg[fidx[:max(3, len(fidx) // 4)]]))
+    ref = max(ref, 1e-9)
+    ratio = np.where(flight, sg / ref, 1.0)
+    if nb >= 3:
+        ratio = np.convolve(np.pad(ratio, 1, mode="edge"), np.ones(3) / 3, mode="valid")
+    gain = np.clip(ratio ** 2, 1.0, cfg["adapt_kp_max_ratio"])
+    return (cfg["att_kp"] * gain).tolist(), np.maximum(ratio, 1.0)
+
+
+# --------------------------------------------------------------------------
 # Quaternion helpers (w, x, y, z), body -> world
 # --------------------------------------------------------------------------
 def quat_from_two_vectors(a, b):
@@ -274,7 +324,7 @@ def quat_from_two_vectors(a, b):
 # Attitude + world acceleration (pure-Python inner loop for speed)
 # --------------------------------------------------------------------------
 def attitude_and_world_acc(tv, gyr, acc, q0, bias0, g_mag, cfg, quat_out,
-                           thrust_axis=None):
+                           thrust_axis=None, kp_blocks=None):
     """Integrate attitude over valid samples.
 
     tv  : float64 [M] seconds
@@ -290,6 +340,9 @@ def attitude_and_world_acc(tv, gyr, acc, q0, bias0, g_mag, cfg, quat_out,
     if drag:
         tx_, ty_, tz_ = (float(v) for v in thrust_axis)
     kp, ki = cfg["att_kp"], cfg["att_ki"]
+    blk_s = cfg["adapt_block_s"]
+    t_first = float(tv[0])
+    nkb = len(kp_blocks) if kp_blocks else 0
     sig = cfg["att_acc_sigma"]
     inv2sig2 = 1.0 / (2.0 * sig * sig)
     identity = cfg["att_mode"] == "identity"
@@ -332,7 +385,11 @@ def attitude_and_world_acc(tv, gyr, acc, q0, bias0, g_mag, cfg, quat_out,
                     wgt = exp(-dev * dev * inv2sig2)
                     if dt > 0.05:     # do not trust correction over gaps
                         wgt *= 0.05 / dt
-                    kpw = kp * wgt
+                    if nkb:
+                        kb = int((t - t_first) / blk_s)
+                        kpw = kp_blocks[kb if kb < nkb else nkb - 1] * wgt
+                    else:
+                        kpw = kp * wgt
                     wx += kpw * ex
                     wy += kpw * ey
                     wz += kpw * ez
@@ -428,7 +485,7 @@ def _vel_from_acc(a, dt):
     return inc
 
 
-def integrate_position(tv, acc_w, cfg, pos_out, drag_w=None):
+def integrate_position(tv, acc_w, cfg, pos_out, drag_w=None, vel_w=None):
     """acc_w float32 [M,3] world accel; pos_out float32 [M,3].
 
     drag_w (optional, float32 [M,3]): world-frame rotor-drag specific force.
@@ -436,6 +493,9 @@ def integrate_position(tv, acc_w, cfg, pos_out, drag_w=None):
     drift-free (but scaled and noisy) velocity observation. Its scale is
     fitted against the band-passed integrated acceleration, and the two are
     fused complementarily: high frequencies from the integral, low from drag.
+
+    vel_w (optional, per adapt-block weights in [0,1]): confidence in the
+    velocity direction; velocity is scaled by it before integration.
 
     Returns the final smoothed velocity (for dead reckoning)."""
     m = len(tv)
@@ -477,6 +537,12 @@ def integrate_position(tv, acc_w, cfg, pos_out, drag_w=None):
                 d = _moving_average(d, hd)
             v += d
             del d
+        if vel_w is not None:
+            blk = cfg["adapt_block_s"]
+            kb = ((tv - tv[0]) / blk).astype(np.int32)
+            np.minimum(kb, len(vel_w) - 1, out=kb)
+            v *= vel_w[kb]
+            del kb
         v_end[ax] = float(np.mean(v[-nwin:]))
         p = _vel_from_acc(v, dt)
         del v
@@ -540,10 +606,21 @@ def estimate(ts, raw, cfg=CFG, log=None):
 
     quat = np.empty((m, 4), np.float32)
     thrust = a_mean / np.linalg.norm(a_mean) if cfg["pos_mode"] == "drag" else None
-    attitude_and_world_acc(tv, gyr, acc, q0, tuple(bias0), g_mag, cfg, quat, thrust)
+    kp_blocks, noise_ratio = adaptive_kp(tv, gyr, acc, cfg)
+    say("gyro noise ratio (max/early)=%.2f  kp range %.3f..%.3f"
+        % (float(noise_ratio.max()), min(kp_blocks), max(kp_blocks)))
+    attitude_and_world_acc(tv, gyr, acc, q0, tuple(bias0), g_mag, cfg, quat, thrust,
+                           kp_blocks)
     pos = np.empty((m, 3), np.float32)
-    v_end = integrate_position(tv, acc, cfg, pos, gyr if thrust is not None else None)
+    # confidence weight on velocity: heading degrades with gyro jamming
+    pw = cfg["conf_power"]
+    vel_w = (noise_ratio ** -pw) if pw > 0 else None
+    v_end = integrate_position(tv, acc, cfg, pos, gyr if thrust is not None else None, vel_w)
     del acc, gyr
+    vxy = float(np.hypot(v_end[0], v_end[1]))
+    if vxy > cfg["blind_vmax_xy"]:
+        v_end[:2] *= cfg["blind_vmax_xy"] / vxy
+    v_end[2] = float(np.clip(v_end[2], -cfg["blind_vmax_z"], cfg["blind_vmax_z"]))
     return tv, pos, quat, {"v_end": v_end}
 
 
