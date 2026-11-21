@@ -7,6 +7,9 @@ post-failure dead reckoning from degraded IMU telemetry only.
 `estimated_trajectory.txt` in TUM format: exactly one pose per input row,
 using a single CPU thread, NumPy only, with a small heap footprint.
 
+**Team Tri-Netra** · Thapar Institute of Engineering & Technology
+Ashutosh Mehta · Keshaw Tiwari · Priyanshu Soni (Computer Engineering, 3rd year)
+
 ---
 
 ## Quick start
