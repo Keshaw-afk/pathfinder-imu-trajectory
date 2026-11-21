@@ -59,7 +59,8 @@ CFG = {
     "att_acc_sigma": 1.5,     # |a|-g tolerance for the correction [m/s^2]
     "vel_hp_s": 6.0,          # velocity high-pass window [s] (0 = off)
     "pos_hp_s": 30.0,         # position high-pass window [s] (0 = off)
-    "pos_mode": "hp",         # "hp" | "zero" (baseline: no translation)
+    "pos_mode": "hp",         # "hp" | "drag" | "zero" (baseline: no translation)
+    "drag_lp_s": 0.0,         # extra low-pass on the drag velocity [s]
     "att_mode": "filter",     # "filter" | "identity" (baseline)
     "blind_tau_s": 1.0,       # velocity decay constant after IMU failure
     "blind_vel_win_s": 1.0,   # window to estimate the last velocity
@@ -272,7 +273,8 @@ def quat_from_two_vectors(a, b):
 # --------------------------------------------------------------------------
 # Attitude + world acceleration (pure-Python inner loop for speed)
 # --------------------------------------------------------------------------
-def attitude_and_world_acc(tv, gyr, acc, q0, bias0, g_mag, cfg, quat_out):
+def attitude_and_world_acc(tv, gyr, acc, q0, bias0, g_mag, cfg, quat_out,
+                           thrust_axis=None):
     """Integrate attitude over valid samples.
 
     tv  : float64 [M] seconds
@@ -280,7 +282,13 @@ def attitude_and_world_acc(tv, gyr, acc, q0, bias0, g_mag, cfg, quat_out):
     acc : float32 [M,3] body specific force; overwritten in place with the
           gravity-compensated world-frame acceleration
     quat_out : float32 [M,4] (w,x,y,z) written in place
+    thrust_axis : optional body unit vector. If given, the gyro buffer is
+          overwritten with the world-frame specific force perpendicular to
+          this axis (multirotor rotor-drag signal, proportional to -velocity).
     """
+    drag = thrust_axis is not None
+    if drag:
+        tx_, ty_, tz_ = (float(v) for v in thrust_axis)
     kp, ki = cfg["att_kp"], cfg["att_ki"]
     sig = cfg["att_acc_sigma"]
     inv2sig2 = 1.0 / (2.0 * sig * sig)
@@ -299,6 +307,7 @@ def attitude_and_world_acc(tv, gyr, acc, q0, bias0, g_mag, cfg, quat_out):
         Am = acc[s:e].tolist()
         Q = []
         W = []
+        D = []
         for i in range(e - s):
             t = T[i]
             gx, gy, gz = Gm[i]
@@ -362,8 +371,16 @@ def attitude_and_world_acc(tv, gyr, acc, q0, bias0, g_mag, cfg, quat_out):
                       r10 * ax + r11 * ay + r12 * az,
                       r20 * ax + r21 * ay + r22 * az - g_mag))
             Q.append((qw, qx, qy, qz))
+            if drag:
+                dp = ax * tx_ + ay * ty_ + az * tz_
+                px, py, pz = ax - dp * tx_, ay - dp * ty_, az - dp * tz_
+                D.append((r00 * px + r01 * py + r02 * pz,
+                          r10 * px + r11 * py + r12 * pz,
+                          r20 * px + r21 * py + r22 * pz))
         acc[s:e] = W
         quat_out[s:e] = Q
+        if drag:
+            gyr[s:e] = D
 
 
 # --------------------------------------------------------------------------
@@ -391,9 +408,23 @@ def _highpass(y, half):
     return y - _moving_average(_moving_average(y, half), half)
 
 
-def integrate_position(tv, acc_w, cfg, pos_out):
+def _vel_from_acc(a, dt):
+    inc = np.empty(len(a), np.float64)
+    inc[0] = 0.0
+    inc[1:] = 0.5 * (a[1:] + a[:-1]) * dt[1:]
+    return np.cumsum(inc)
+
+
+def integrate_position(tv, acc_w, cfg, pos_out, drag_w=None):
     """acc_w float32 [M,3] world accel; pos_out float32 [M,3].
-    Returns final smoothed velocity (for dead reckoning)."""
+
+    drag_w (optional, float32 [M,3]): world-frame rotor-drag specific force.
+    For a multirotor it is approximately -k * horizontal velocity, i.e. a
+    drift-free (but scaled and noisy) velocity observation. Its scale is
+    fitted against the band-passed integrated acceleration, and the two are
+    fused complementarily: high frequencies from the integral, low from drag.
+
+    Returns the final smoothed velocity (for dead reckoning)."""
     m = len(tv)
     if cfg["pos_mode"] == "zero" or m < 3:
         pos_out[:] = 0.0
@@ -404,22 +435,38 @@ def integrate_position(tv, acc_w, cfg, pos_out):
     med_dt = float(np.median(dt[1:])) if m > 1 else 0.005
     hv = int(round(cfg["vel_hp_s"] / med_dt / 2.0))
     hp = int(round(cfg["pos_hp_s"] / med_dt / 2.0))
+    hd = int(round(cfg["drag_lp_s"] / med_dt / 2.0))
     nwin = max(1, int(round(cfg["blind_vel_win_s"] / med_dt)))
+    use_drag = drag_w is not None and cfg["pos_mode"] == "drag"
+    scale = 0.0
+    if use_drag:
+        # fit v ~= scale * drag on band-passed signals (horizontal axes)
+        hs = max(1, int(round(0.25 / med_dt)))
+        num = den = 0.0
+        for ax in range(2):
+            v = _vel_from_acc(acc_w[:, ax].astype(np.float64), dt)
+            v = _moving_average(_highpass(v, hv), hs)
+            d = _moving_average(_highpass(drag_w[:, ax].astype(np.float64), hv), hs)
+            num += float(np.dot(v, d))
+            den += float(np.dot(d, d))
+            del v, d
+        scale = num / den if den > 0 else 0.0
+        if scale > 0:          # physically the drag opposes velocity
+            scale = 0.0
     v_end = np.zeros(3)
     for ax in range(3):
-        a = acc_w[:, ax].astype(np.float64)
-        # trapezoidal velocity integration
-        inc = np.empty(m, np.float64)
-        inc[0] = 0.0
-        inc[1:] = 0.5 * (a[1:] + a[:-1]) * dt[1:]
-        del a
-        v = np.cumsum(inc)
+        v = _vel_from_acc(acc_w[:, ax].astype(np.float64), dt)
         v = _highpass(v, hv)
+        if use_drag and ax < 2 and scale != 0.0:
+            d = drag_w[:, ax].astype(np.float64) * scale
+            d = _moving_average(_moving_average(d, hv), hv)
+            if hd > 0:
+                d = _moving_average(d, hd)
+            v += d
+            del d
         v_end[ax] = float(np.mean(v[-nwin:]))
-        inc[1:] = 0.5 * (v[1:] + v[:-1]) * dt[1:]
+        p = _vel_from_acc(v, dt)
         del v
-        p = np.cumsum(inc)
-        del inc
         p = _highpass(p, hp)
         pos_out[:, ax] = p
         del p
@@ -478,11 +525,11 @@ def estimate(ts, raw, cfg=CFG, log=None):
     say("init: static=%s g=%.4f bias=%s" % (static, g_mag, np.round(bias0, 5)))
 
     quat = np.empty((m, 4), np.float32)
-    attitude_and_world_acc(tv, gyr, acc, q0, tuple(bias0), g_mag, cfg, quat)
-    del gyr
+    thrust = a_mean / np.linalg.norm(a_mean) if cfg["pos_mode"] == "drag" else None
+    attitude_and_world_acc(tv, gyr, acc, q0, tuple(bias0), g_mag, cfg, quat, thrust)
     pos = np.empty((m, 3), np.float32)
-    v_end = integrate_position(tv, acc, cfg, pos)
-    del acc
+    v_end = integrate_position(tv, acc, cfg, pos, gyr if thrust is not None else None)
+    del acc, gyr
     return tv, pos, quat, {"v_end": v_end, "idx_last": int(idx[-1])}
 
 
