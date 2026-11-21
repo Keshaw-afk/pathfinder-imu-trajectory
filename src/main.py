@@ -70,7 +70,7 @@ CFG = {
     "pos_hp_s": 10.0,         # position high-pass window [s] (0 = off)
     "pos_mode": "drag",        # "hp" | "drag" | "zero" (baseline: no translation)
     "drag_lp_s": 0.0,         # extra low-pass on the drag velocity [s]
-    "hp_edge": "linear",      # high-pass edge handling: "linear" | "mean"
+    "hp_edge": "mean",        # high-pass edge handling: "mean" | "linear" (see README)
     "pos_gain": 1.0,          # global shrink of the translation estimate
     "pos_rms_cap": 0.0,       # cap on the estimate's RMS spread [m] (0 = off)
     "drag_scale_fixed": 0.0,  # fixed velocity/drag scale [s] (0 = fit per flight)
@@ -625,7 +625,7 @@ def integrate_position(tv, acc_w, cfg, pos_out, drag_w=None, vel_w=None):
     v_end = np.zeros(3)
     for ax in range(3):
         v = _vel_from_acc(acc_w[:, ax].astype(np.float64), dt)
-        v = _highpass(v, hv, cfg["hp_edge"])
+        v = _highpass(v, hv, cfg.get("hp_edge_vel") or cfg["hp_edge"])
         if use_drag and ax < 2 and scale != 0.0:
             d = drag_w[:, ax].astype(np.float64) * scale
             d = _moving_average(_moving_average(d, hv), hv)
@@ -642,7 +642,7 @@ def integrate_position(tv, acc_w, cfg, pos_out, drag_w=None, vel_w=None):
         v_end[ax] = float(np.mean(v[-nwin:]))
         p = _vel_from_acc(v, dt)
         del v
-        p = _highpass(p, hp, cfg["hp_edge"])
+        p = _highpass(p, hp, cfg.get("hp_edge_pos") or cfg["hp_edge"])
         pos_out[:, ax] = p
         del p
     return v_end

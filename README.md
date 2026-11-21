@@ -81,10 +81,11 @@ docker run --rm -v "$PWD:/work" pathfinder /work/input.zip -o /work/estimated_tr
    signal minus its triangular moving average). This removes the quadratic
    drift that bias and tilt errors cause while keeping the motion an IMU can
    actually observe.
-   * **Local-linear edges.** Near the start and end of the recording the
-     smoothing window is one-sided, and a plain average lags behind a drift
-     trend. A local linear fit tracks it exactly. This keeps the scored
-     blind window from blowing up.
+   * **Edge handling.** Near the ends of the recording the smoothing window is
+     one-sided. A local-linear variant (`hp_edge="linear"`) removes the lag
+     and is essential for long windows: MH_04 blind 5 s goes 11.4 → 6.0 m at
+     30 s. At the short windows we ship, the plain one-sided average was
+     better on 15 of 22 blind windows, so it is the default.
    * **Rotor-drag velocity** (`pos_mode="drag"`). On a multirotor, the
      specific force perpendicular to the thrust axis is ≈ −k·v. This
      drift-free velocity cue is scaled by regression and fused complementarily
@@ -116,13 +117,13 @@ position.
 
 | Mean over 22 runs | Ours | B0 | Change |
 |---|---|---|---|
-| ATE, whole trajectory | 3.21 m | 3.45 m | −7.0 % |
-| ATE, blind last 5 s | 3.08 m | 3.09 m | −0.4 % |
-| ATE, 1 s after dropouts | 3.30 m | 3.48 m | −5.4 % |
+| ATE, whole trajectory | 3.23 m | 3.45 m | −6.4 % |
+| ATE, blind last 5 s | 2.69 m | 3.09 m | −13.0 % |
+| ATE, 1 s after dropouts | 3.30 m | 3.48 m | −5.3 % |
 
 * 19 of 22 runs beat B0 on the rubric-weighted score
-  (0.5·ATE + 0.33·blind + 0.17·dropout, each ÷ B0). Mean score 0.934; worst
-  run 1.03.
+  (0.5·ATE + 0.33·blind + 0.17·dropout, each ÷ B0). Mean score 0.913; worst
+  run 1.11 (V1_03, script-as-written variant).
 * Settings were chosen on the 22-run mean, never on a single flight.
   Longer filter windows track more motion on some flights but are up to 5×
   worse on others.
