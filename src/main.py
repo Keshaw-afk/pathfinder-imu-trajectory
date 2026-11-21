@@ -387,17 +387,26 @@ def attitude_and_world_acc(tv, gyr, acc, q0, bias0, g_mag, cfg, quat_out,
 # Zero-phase drift suppression
 # --------------------------------------------------------------------------
 def _moving_average(y, half):
-    """Centered moving average with shrinking window at the edges (float64)."""
+    """Centered moving average with shrinking window at the edges (float64).
+    Allocates only the cumulative-sum and output arrays."""
     n = len(y)
     if half <= 0 or n == 0:
-        return np.zeros_like(y)
+        return np.array(y, np.float64)
     c = np.empty(n + 1, np.float64)
     c[0] = 0.0
     np.cumsum(y, out=c[1:])
-    idx = np.arange(n)
-    lo = np.maximum(idx - half, 0)
-    hi = np.minimum(idx + half + 1, n)
-    out = (c[hi] - c[lo]) / (hi - lo)
+    out = np.empty(n, np.float64)
+    w = 2 * half + 1
+    if n > w - 1:
+        np.subtract(c[w:], c[:n + 1 - w], out=out[half:n - half])
+        out[half:n - half] /= w
+    k = min(half, n)
+    i = np.arange(k)                       # left edge
+    hi = np.minimum(i + half + 1, n)
+    out[:k] = c[hi] / hi
+    i = np.arange(max(n - half, k), n)     # right edge
+    lo = np.maximum(i - half, 0)
+    out[i] = (c[n] - c[lo]) / (n - lo)
     return out
 
 
@@ -409,10 +418,14 @@ def _highpass(y, half):
 
 
 def _vel_from_acc(a, dt):
+    """Trapezoidal cumulative integral; consumes nothing, returns float64."""
     inc = np.empty(len(a), np.float64)
     inc[0] = 0.0
-    inc[1:] = 0.5 * (a[1:] + a[:-1]) * dt[1:]
-    return np.cumsum(inc)
+    np.add(a[1:], a[:-1], out=inc[1:])
+    inc[1:] *= dt[1:]
+    inc[1:] *= 0.5
+    np.cumsum(inc, out=inc)
+    return inc
 
 
 def integrate_position(tv, acc_w, cfg, pos_out, drag_w=None):
@@ -485,22 +498,23 @@ def estimate(ts, raw, cfg=CFG, log=None):
     say("rows=%d valid=%d swapped_columns=%s acc_scale=%.3f"
         % (n, int(ok.sum()), swapped, ascale))
 
-    idx = np.flatnonzero(ok)
+    idx = np.flatnonzero(ok).astype(np.int32)
+    del ok
     if len(idx) < 10:
         raise RuntimeError("not enough valid IMU rows")
     m = len(idx)
     ts0 = int(ts[0])
-    tv = (ts[idx] - ts0).astype(np.float64) * 1e-9
-
-    # compact valid rows into contiguous gyro/acc buffers (float32)
-    gyr = np.empty((m, 3), np.float32)
-    acc = np.empty((m, 3), np.float32)
+    # Compact the valid rows in place at the front of the raw buffer (safe:
+    # idx[k] >= k, so a row is always read before its slot is overwritten).
+    tv = np.empty(m, np.float64)
     ch = cfg["chunk"]
     for s in range(0, m, ch):
         sl = idx[s:s + ch]
-        blk = raw[sl]
-        gyr[s:s + ch] = blk[:, list(gcols)]
-        acc[s:s + ch] = blk[:, list(acols)]
+        tv[s:s + ch] = (ts[sl] - ts0) * 1e-9
+        raw[s:s + len(sl)] = raw[sl]
+    del idx
+    gyr = raw[:m, gcols[0]:gcols[0] + 3]   # views, no copies
+    acc = raw[:m, acols[0]:acols[0] + 3]
     if ascale != 1.0:
         acc *= ascale
 
@@ -530,19 +544,29 @@ def estimate(ts, raw, cfg=CFG, log=None):
     pos = np.empty((m, 3), np.float32)
     v_end = integrate_position(tv, acc, cfg, pos, gyr if thrust is not None else None)
     del acc, gyr
-    return tv, pos, quat, {"v_end": v_end, "idx_last": int(idx[-1])}
+    return tv, pos, quat, {"v_end": v_end}
 
 
-def write_tum(out_path, ts, tv, pos, quat, v_end, cfg=CFG, chunk=4096):
+def write_tum(out_path, ts, tv, pos, quat, v_end, cfg=CFG, chunk=1024):
     """Interpolate the estimate onto every input timestamp and stream it out."""
     ts0 = int(ts[0])
     t_last = float(tv[-1])
     tau = cfg["blind_tau_s"]
     # make quaternion sign continuous for safe component interpolation
-    if len(quat) > 1:
-        d = np.einsum("ij,ij->i", quat[1:], quat[:-1])
-        flip = np.cumsum(d < 0) % 2 == 1
-        quat[1:][flip] *= -1.0
+    m = len(quat)
+    parity = 0
+    prev = quat[0].copy()
+    for s in range(1, m, chunk):
+        blk = quat[s:s + chunk]
+        prv = np.empty_like(blk)
+        prv[0] = prev
+        prv[1:] = blk[:-1]
+        neg = np.einsum("ij,ij->i", blk, prv) < 0
+        par = (np.cumsum(neg) + parity) % 2 == 1
+        parity = int(par[-1])
+        prev = blk[-1].copy()
+        blk[par] *= -1.0
+        del prv, neg, par
     with open(out_path, "w") as f:
         f.write("# timestamp tx ty tz qx qy qz qw\n")
         n = len(ts)

@@ -161,7 +161,7 @@ def extract_wanted(zi, seq, out_root):
         print("  %s: %s (%.1f MB)" % (seq, want, len(data) / 1e6), flush=True)
 
 
-def fetch(seq, out_root):
+def fetch(seq, out_root, workers=8):
     group = "machine_hall" if seq.startswith("MH") else (
         "vicon_room1" if seq.startswith("V1") else "vicon_room2")
     url = ARCHIVES[group]
@@ -178,7 +178,7 @@ def fetch(seq, out_root):
         os.makedirs(tmp_dir, exist_ok=True)
         comp_path = os.path.join(tmp_dir, seq + ".deflate")
         zip_path = os.path.join(tmp_dir, seq + ".zip")
-        parallel_download(url, off, info.compress_size, comp_path)
+        parallel_download(url, off, info.compress_size, comp_path, workers=workers)
         inflate_file(comp_path, zip_path)
         os.remove(comp_path)
         with zipfile.ZipFile(zip_path) as zi:
@@ -215,10 +215,11 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("seqs", nargs="+")
     ap.add_argument("--out", default=os.path.join(here, "..", "data", "raw"))
+    ap.add_argument("--workers", type=int, default=8, help="parallel range requests")
     args = ap.parse_args()
     for s in args.seqs:
         try:
-            fetch(s, args.out)
+            fetch(s, args.out, args.workers)
         except Exception as e:  # keep going with the other sequences
             print("  %s: FAILED (%s)" % (s, e), file=sys.stderr)
 
