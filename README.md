@@ -64,17 +64,34 @@ docker run --rm -v "$PWD:/work" pathfinder /work/input.zip -o /work/estimated_tr
 3. **Spike rejection.** A windowed Hampel filter with a global noise floor
    replaces samples more than 8 robust σ from the local median.
 4. **Static initialisation.** The undamaged lead-in gives the gravity
-   direction (roll and pitch), the local gravity magnitude and the initial gyro
-   bias.
+   direction (roll and pitch). Gyro bias and the local gravity magnitude come
+   from the quietest 2 s window in the first 60 s, because EuRoC flights
+   often start hand-carried. If no window is still enough, the thresholds
+   are relaxed 3×.
 5. **Attitude.** A Mahony-style complementary filter integrates the gyro on
    SO(3). The accelerometer pulls the gravity direction back slowly, with
    lower weight when |a| deviates from g. An integral term tracks gyro-bias
    drift.
+   * **Jamming-aware gain.** Rotor vibration is anisotropic; injected
+     jamming noise is isotropic. The noise level of the *quietest* gyro axis,
+     per 2 s block, relative to early flight, detects gyro corruption. The
+     correction gain grows with its square.
 6. **Position.** The gravity-compensated world acceleration is integrated
    twice. Each integration is followed by a **zero-phase high-pass** (the
    signal minus its triangular moving average). This removes the quadratic
    drift that bias and tilt errors cause while keeping the motion an IMU can
    actually observe.
+   * **Local-linear edges.** Near the start and end of the recording the
+     smoothing window is one-sided, and a plain average lags behind a drift
+     trend. A local linear fit tracks it exactly. This keeps the scored
+     blind window from blowing up.
+   * **Rotor-drag velocity** (`pos_mode="drag"`). On a multirotor, the
+     specific force perpendicular to the thrust axis is ≈ −k·v. This
+     drift-free velocity cue is scaled by regression and fused complementarily
+     with the integrated velocity.
+   * **Confidence weighting.** Velocity is scaled down when the jamming
+     detector reports a corrupted gyro: holding position costs less ATE than
+     moving in a wrong direction.
 7. **Dead reckoning.** After the last valid sample, the orientation is held
    and the position continues along the recent smoothed velocity with
    exponential decay.

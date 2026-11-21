@@ -71,6 +71,9 @@ CFG = {
     "pos_mode": "drag",        # "hp" | "drag" | "zero" (baseline: no translation)
     "drag_lp_s": 0.0,         # extra low-pass on the drag velocity [s]
     "hp_edge": "linear",      # high-pass edge handling: "linear" | "mean"
+    "pos_gain": 1.0,          # global shrink of the translation estimate
+    "pos_rms_cap": 0.0,       # cap on the estimate's RMS spread [m] (0 = off)
+    "drag_scale_fixed": 0.0,  # fixed velocity/drag scale [s] (0 = fit per flight)
     "drag_scale_min": -10.0,  # bound on fitted velocity/drag scale (= -1/k) [s]
     "att_mode": "filter",     # "filter" | "identity" (baseline)
     "blind_tau_s": 1.0,       # velocity decay constant after IMU failure
@@ -272,6 +275,7 @@ def find_static_window(tv, gyr, acc, cfg):
     t_end = min(float(tv[-1]), t0 + cfg["static_search_s"])
     step = 0.5
     best, best_score = None, None
+    relaxed, relaxed_score = None, None
     t = t0
     while t + win <= t_end:
         lo = int(np.searchsorted(tv, t))
@@ -283,8 +287,14 @@ def find_static_window(tv, gyr, acc, cfg):
             if gs < cfg["static_gyr_std"] and asd < cfg["static_acc_std"] and (
                     best_score is None or sc < best_score):
                 best, best_score = (lo, hi), sc
+            # fallback: quietest window under 3x relaxed thresholds (e.g. a
+            # slow hover); the bias estimate is then approximate but far
+            # better than assuming zero
+            if gs < 3 * cfg["static_gyr_std"] and asd < 3 * cfg["static_acc_std"] and (
+                    relaxed_score is None or sc < relaxed_score):
+                relaxed, relaxed_score = (lo, hi), sc
         t += step
-    return best
+    return best if best is not None else relaxed
 
 
 # --------------------------------------------------------------------------
@@ -607,6 +617,10 @@ def integrate_position(tv, acc_w, cfg, pos_out, drag_w=None, vel_w=None):
         if scale > 0:          # physically the drag opposes velocity
             scale = 0.0
         scale = max(scale, cfg["drag_scale_min"])
+        if cfg["drag_scale_fixed"] != 0.0:
+            # the drag coefficient is a property of the airframe; a fixed
+            # value is more reliable than a per-flight fit
+            scale = cfg["drag_scale_fixed"]
         cfg["_drag_scale"] = scale
     v_end = np.zeros(3)
     for ax in range(3):
@@ -718,6 +732,20 @@ def estimate(ts, raw, cfg=CFG, log=None):
     vel_w = (noise_ratio ** -pw) if pw > 0 else None
     v_end = integrate_position(tv, acc, cfg, pos, gyr if thrust is not None else None, vel_w)
     del acc, gyr
+    # Plausibility guard: a drifting estimate that wanders far beyond a
+    # flying-arena scale costs more ATE than it gains, so damp it.
+    g = cfg["pos_gain"]
+    rms = 0.0
+    for c in range(3):
+        col = pos[:, c].astype(np.float64)
+        rms += float(np.mean((col - col.mean()) ** 2))
+    rms = math.sqrt(rms)
+    if cfg["pos_rms_cap"] > 0 and rms * g > cfg["pos_rms_cap"]:
+        g = cfg["pos_rms_cap"] / rms
+    if g != 1.0:
+        pos *= g
+        v_end *= g
+    say("position spread rms=%.2f m, applied gain %.3f" % (rms, g))
     if "_drag_scale" in cfg:
         say("drag velocity scale (-1/k) = %.3f s" % cfg["_drag_scale"])
     vxy = float(np.hypot(v_end[0], v_end[1]))
