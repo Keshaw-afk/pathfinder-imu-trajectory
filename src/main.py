@@ -70,6 +70,7 @@ CFG = {
     "pos_hp_s": 10.0,         # position high-pass window [s] (0 = off)
     "pos_mode": "drag",        # "hp" | "drag" | "zero" (baseline: no translation)
     "drag_lp_s": 0.0,         # extra low-pass on the drag velocity [s]
+    "hp_edge": "linear",      # high-pass edge handling: "linear" | "mean"
     "drag_scale_min": -10.0,  # bound on fitted velocity/drag scale (= -1/k) [s]
     "att_mode": "filter",     # "filter" | "identity" (baseline)
     "blind_tau_s": 1.0,       # velocity decay constant after IMU failure
@@ -499,11 +500,58 @@ def _moving_average(y, half):
     return out
 
 
-def _highpass(y, half):
-    """y - MA(MA(y)): zero-phase high-pass (triangular kernel)."""
+def _local_linear(y, half):
+    """Centered moving local-linear fit (box kernel), evaluated at the centre.
+
+    Identical to the moving average in the interior (symmetric window), but
+    near the edges the window is one-sided and a plain average lags behind any
+    trend. Fitting a line instead extrapolates the trend correctly, which
+    removes the drift blow-up at the start and end of the recording."""
+    n = len(y)
+    if half <= 0 or n == 0:
+        return np.array(y, np.float64)
+    out = _moving_average(y, half)
+    k = min(half, n)
+    if k == 0:
+        return out
+    # only the edge rows differ from the moving average; handle both edges
+    # with small local arrays (size <= 2*half+1)
+    for side in (0, 1):
+        if side == 0:
+            idx = np.arange(k)
+        else:
+            idx = np.arange(max(n - half, k), n)
+        if len(idx) == 0:
+            continue
+        lo = np.maximum(idx - half, 0)
+        hi = np.minimum(idx + half + 1, n)
+        seg_lo, seg_hi = int(lo.min()), int(hi.max())
+        ys = np.asarray(y[seg_lo:seg_hi], np.float64)
+        xs = np.arange(seg_lo, seg_hi, dtype=np.float64)
+        c0 = np.concatenate([[0.0], np.cumsum(ys)])
+        c1 = np.concatenate([[0.0], np.cumsum(xs * ys)])
+        cx = np.concatenate([[0.0], np.cumsum(xs)])
+        cxx = np.concatenate([[0.0], np.cumsum(xs * xs)])
+        a, b = lo - seg_lo, hi - seg_lo
+        cnt = (hi - lo).astype(np.float64)
+        sy = c0[b] - c0[a]
+        sx = cx[b] - cx[a] - cnt * idx          # sums of (x - i)
+        sxx = (cxx[b] - cxx[a]) - 2 * idx * (cx[b] - cx[a]) + cnt * idx * idx
+        sxy = (c1[b] - c1[a]) - idx * sy
+        den = cnt * sxx - sx * sx
+        good = den > 1e-9
+        val = np.where(good, (sxx * sy - sx * sxy) / np.where(good, den, 1.0), sy / cnt)
+        out[idx] = val
+    return out
+
+
+def _highpass(y, half, edge="linear"):
+    """Zero-phase high-pass: y - LP(LP(y)) with a box kernel applied twice
+    (triangular). edge="linear" uses local-linear fits near the ends."""
     if half <= 0:
         return y
-    return y - _moving_average(_moving_average(y, half), half)
+    lp = _local_linear if edge == "linear" else _moving_average
+    return y - lp(lp(y, half), half)
 
 
 def _vel_from_acc(a, dt):
@@ -563,7 +611,7 @@ def integrate_position(tv, acc_w, cfg, pos_out, drag_w=None, vel_w=None):
     v_end = np.zeros(3)
     for ax in range(3):
         v = _vel_from_acc(acc_w[:, ax].astype(np.float64), dt)
-        v = _highpass(v, hv)
+        v = _highpass(v, hv, cfg["hp_edge"])
         if use_drag and ax < 2 and scale != 0.0:
             d = drag_w[:, ax].astype(np.float64) * scale
             d = _moving_average(_moving_average(d, hv), hv)
@@ -580,7 +628,7 @@ def integrate_position(tv, acc_w, cfg, pos_out, drag_w=None, vel_w=None):
         v_end[ax] = float(np.mean(v[-nwin:]))
         p = _vel_from_acc(v, dt)
         del v
-        p = _highpass(p, hp)
+        p = _highpass(p, hp, cfg["hp_edge"])
         pos_out[:, ax] = p
         del p
     return v_end

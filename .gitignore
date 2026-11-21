@@ -6,7 +6,7 @@ __pycache__/
 # datasets and generated outputs (large / third-party)
 data/
 *.zip
-!submission/*.zip
+submission/
 
 # organiser material is kept outside this repository
 personal/
