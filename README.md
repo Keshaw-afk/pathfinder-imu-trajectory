@@ -164,6 +164,8 @@ src/main.py             submission entrypoint (NumPy + stdlib only)
 tools/fetch_euroc.py    range-download IMU + ground truth from the EuRoC archives
 tools/make_dataset.py   apply the organiser degradation (both column orders)
 tools/evaluate.py       format checks, ATE / RPE, heap and runtime
+tools/package_submission.py  build the team_name.zip bundle
+submission/TIET_Tri-Netra.zip  Track 3 bundle (trajectory on degraded MH_01 + metadata + src)
 Dockerfile              reproducible runtime
 ```
 
