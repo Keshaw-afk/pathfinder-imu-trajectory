@@ -130,8 +130,9 @@ position.
 * Settings were chosen on the 22-run mean, never on a single flight.
   Longer filter windows track more motion on some flights but are up to 5×
   worse on others.
-* Efficiency on MH_04 (19 753 rows, 101 s): peak heap 3.0 MB (tracemalloc),
-  5.2–5.8 ms per second of IMU, single thread.
+* Efficiency: peak heap 3.0 MB on MH_04 (19 753 rows, 101 s) and 4.2 MB on
+  MH_01, the longest flight (35 629 rows, 184 s), measured with tracemalloc;
+  5.2–5.9 ms per second of IMU, single thread.
 
 IMU-only position under this level of corruption is weakly observable. The
 method keeps only the motion it can trust, which is what the alignment-based
